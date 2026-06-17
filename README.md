@@ -2,7 +2,7 @@
 
 粉白配色的 Windows 桌面小窗，用来显示 Codex 本地日志里的最近一次额度快照。
 
-![Pink theme preview](quota_pink_style_previews.png)
+![Theme preview](theme_preview.png)
 
 ## 功能
 
