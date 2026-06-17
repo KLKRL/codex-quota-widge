@@ -21,6 +21,7 @@ SETTINGS_PATH = SETTINGS_DIR / "settings.json"
 REFRESH_MS = 30_000
 WINDOW_W = 350
 WINDOW_H = 164
+SCALE_OPTIONS = [0.85, 1.0, 1.15, 1.3]
 
 THEME_ORDER = ["berry", "cream", "sakura", "mint", "sky", "dark"]
 THEMES = {
@@ -126,6 +127,8 @@ class QuotaSnapshot:
     plan_type: str | None
     source_file: str | None
     source_timestamp: str | None
+    limit_id: str | None = None
+    credits_exhausted: bool = False
 
 
 def read_settings() -> dict:
@@ -197,12 +200,19 @@ def find_latest_snapshot() -> QuotaSnapshot | None:
                     limits = payload.get("rate_limits")
             if not isinstance(limits, dict):
                 continue
+            primary = parse_limit(limits.get("primary"))
+            secondary = parse_limit(limits.get("secondary"))
+            if primary.used is None and secondary.used is None:
+                continue
+            credits = limits.get("credits")
             return QuotaSnapshot(
-                primary=parse_limit(limits.get("primary")),
-                secondary=parse_limit(limits.get("secondary")),
+                primary=primary,
+                secondary=secondary,
                 plan_type=limits.get("plan_type"),
                 source_file=str(path),
                 source_timestamp=item.get("timestamp"),
+                limit_id=limits.get("limit_id"),
+                credits_exhausted=isinstance(credits, dict) and credits.get("has_credits") is False,
             )
     return None
 
@@ -249,6 +259,9 @@ class QuotaWidget:
     def __init__(self) -> None:
         self.settings = read_settings()
         self.topmost = bool(self.settings.get("topmost", True))
+        self.scale = float(self.settings.get("scale", 1.0))
+        if self.scale not in SCALE_OPTIONS:
+            self.scale = 1.0
         self.theme_name = self.settings.get("theme", "berry")
         if self.theme_name not in THEMES:
             self.theme_name = "berry"
@@ -261,11 +274,13 @@ class QuotaWidget:
         self.root.configure(bg=self.theme["card"])
         self.root.resizable(False, False)
 
-        x = int(self.settings.get("x", self.root.winfo_screenwidth() - WINDOW_W - 40))
+        self.window_w = int(WINDOW_W * self.scale)
+        self.window_h = int(WINDOW_H * self.scale)
+        x = int(self.settings.get("x", self.root.winfo_screenwidth() - self.window_w - 40))
         y = int(self.settings.get("y", 90))
-        self.root.geometry(f"{WINDOW_W}x{WINDOW_H}+{x}+{y}")
+        self.root.geometry(f"{self.window_w}x{self.window_h}+{x}+{y}")
 
-        self.canvas = tk.Canvas(self.root, width=WINDOW_W, height=WINDOW_H, bg=self.theme["card"], highlightthickness=0)
+        self.canvas = tk.Canvas(self.root, width=self.window_w, height=self.window_h, bg=self.theme["card"], highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
         self.drag_offset = (0, 0)
         self.snapshot: QuotaSnapshot | None = None
@@ -280,7 +295,20 @@ class QuotaWidget:
         self.refresh()
         self.root.after(REFRESH_MS, self.periodic_refresh)
 
+    def v(self, value: float) -> int:
+        return int(round(value * self.scale))
+
+    def font(self, family: str, size: int, weight: str = "normal") -> tuple[str, int, str]:
+        return (family, max(7, int(round(size * self.scale))), weight)
+
+    def text(self, x: int, y: int, **kwargs) -> None:
+        self.canvas.create_text(self.v(x), self.v(y), **kwargs)
+
+    def rect(self, x1: int, y1: int, x2: int, y2: int, **kwargs) -> None:
+        self.canvas.create_rectangle(self.v(x1), self.v(y1), self.v(x2), self.v(y2), **kwargs)
+
     def rounded_rect(self, x1: int, y1: int, x2: int, y2: int, r: int, fill: str, outline: str = "") -> None:
+        x1, y1, x2, y2, r = self.v(x1), self.v(y1), self.v(x2), self.v(y2), self.v(r)
         self.canvas.create_arc(x1, y1, x1 + 2 * r, y1 + 2 * r, start=90, extent=90, fill=fill, outline=outline)
         self.canvas.create_arc(x2 - 2 * r, y1, x2, y1 + 2 * r, start=0, extent=90, fill=fill, outline=outline)
         self.canvas.create_arc(x2 - 2 * r, y2 - 2 * r, x2, y2, start=270, extent=90, fill=fill, outline=outline)
@@ -289,7 +317,8 @@ class QuotaWidget:
         self.canvas.create_rectangle(x1, y1 + r, x2, y2 - r, fill=fill, outline=outline)
 
     def progress_bar(self, x: int, y: int, width: int, value: float | None, color: str) -> None:
-        height = 8
+        height = self.v(8)
+        width = self.v(width)
         scale = 4
         image = Image.new("RGBA", (width * scale, height * scale), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
@@ -312,9 +341,11 @@ class QuotaWidget:
         image = image.resize((width, height), Image.Resampling.LANCZOS)
         photo = ImageTk.PhotoImage(image)
         self.image_refs.append(photo)
-        self.canvas.create_image(x, y, image=photo, anchor="nw")
+        self.canvas.create_image(self.v(x), self.v(y), image=photo, anchor="nw")
 
     def pill(self, x: int, y: int, width: int, height: int, fill: str) -> None:
+        width = self.v(width)
+        height = self.v(height)
         scale = 4
         image = Image.new("RGBA", (width * scale, height * scale), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
@@ -326,12 +357,12 @@ class QuotaWidget:
         image = image.resize((width, height), Image.Resampling.LANCZOS)
         photo = ImageTk.PhotoImage(image)
         self.image_refs.append(photo)
-        self.canvas.create_image(x, y, image=photo, anchor="nw")
+        self.canvas.create_image(self.v(x), self.v(y), image=photo, anchor="nw")
 
     def draw_limit(self, y: int, title: str, limit: LimitInfo) -> None:
         color = status_color(limit.remaining, self.theme)
-        self.canvas.create_text(24, y, anchor="w", text=title, fill=self.theme["text"], font=("Microsoft YaHei UI", 10, "bold"))
-        self.canvas.create_text(315, y - 4, anchor="e", text=fmt_percent(limit.remaining), fill=color, font=("Segoe UI", 20, "bold"))
+        self.text(24, y, anchor="w", text=title, fill=self.theme["text"], font=self.font("Microsoft YaHei UI", 10, "bold"))
+        self.text(315, y - 4, anchor="e", text=fmt_percent(limit.remaining), fill=color, font=self.font("Segoe UI", 20, "bold"))
         self.progress_bar(104, y + 5, 154, limit.remaining, color)
 
     def redraw(self) -> None:
@@ -339,22 +370,22 @@ class QuotaWidget:
         self.image_refs.clear()
         self.root.configure(bg=self.theme["card"])
         self.canvas.configure(bg=self.theme["card"])
-        self.canvas.create_rectangle(0, 0, WINDOW_W, WINDOW_H, fill=self.theme["card"], outline=self.theme["card"])
-        self.canvas.create_rectangle(0, 0, WINDOW_W, 58, fill=self.theme["header"], outline=self.theme["header"])
+        self.rect(0, 0, WINDOW_W, WINDOW_H, fill=self.theme["card"], outline=self.theme["card"])
+        self.rect(0, 0, WINDOW_W, 58, fill=self.theme["header"], outline=self.theme["header"])
 
-        self.canvas.create_text(24, 32, anchor="w", text="Codex Quota", fill=self.theme["text"], font=("Segoe UI", 16, "bold"))
+        self.text(24, 32, anchor="w", text="Codex Quota", fill=self.theme["text"], font=self.font("Segoe UI", 16, "bold"))
         plan = self.snapshot.plan_type if self.snapshot else "offline"
         self.pill(284, 23, 36, 18, self.theme["pill"])
-        self.canvas.create_text(302, 32, anchor="center", text=str(plan).upper(), fill=self.theme["secondary"], font=("Segoe UI", 8, "bold"))
+        self.text(302, 32, anchor="center", text=str(plan).upper(), fill=self.theme["secondary"], font=self.font("Segoe UI", 8, "bold"))
 
         if self.snapshot is None:
-            self.canvas.create_text(175, 96, text="等待 Codex 写入额度日志", fill=self.theme["text"], font=("Microsoft YaHei UI", 11))
-            self.canvas.create_text(175, 123, text="右键可以手动刷新", fill=self.theme["muted"], font=("Microsoft YaHei UI", 9))
+            self.text(175, 96, text="等待 Codex 写入额度日志", fill=self.theme["text"], font=self.font("Microsoft YaHei UI", 11))
+            self.text(175, 123, text="右键可以手动刷新", fill=self.theme["muted"], font=self.font("Microsoft YaHei UI", 9))
             return
 
         self.draw_limit(82, "五小时", self.snapshot.primary)
         self.draw_limit(114, "周额度", self.snapshot.secondary)
-        self.canvas.create_text(
+        self.text(
             24,
             146,
             anchor="w",
@@ -363,7 +394,7 @@ class QuotaWidget:
                 f"周额 {fmt_datetime(self.snapshot.secondary.resets_at)}"
             ),
             fill=self.theme["muted"],
-            font=("Microsoft YaHei UI", 8),
+            font=self.font("Microsoft YaHei UI", 8),
         )
 
     def refresh(self) -> None:
@@ -400,8 +431,8 @@ class QuotaWidget:
         self.menu_window.overrideredirect(True)
         self.menu_window.attributes("-topmost", True)
         self.menu_window.configure(bg=self.theme["card"])
-        self.menu_window.geometry(f"132x160+{event.x_root}+{event.y_root}")
-        canvas = tk.Canvas(self.menu_window, width=132, height=160, bg=self.theme["card"], highlightthickness=0)
+        self.menu_window.geometry(f"132x188+{event.x_root}+{event.y_root}")
+        canvas = tk.Canvas(self.menu_window, width=132, height=188, bg=self.theme["card"], highlightthickness=0)
         canvas.pack(fill="both", expand=True)
 
         def menu_rect(x1: int, y1: int, x2: int, y2: int, r: int, fill: str, outline: str = "") -> None:
@@ -412,13 +443,14 @@ class QuotaWidget:
             canvas.create_rectangle(x1 + r, y1, x2 - r, y2, fill=fill, outline=outline)
             canvas.create_rectangle(x1, y1 + r, x2, y2 - r, fill=fill, outline=outline)
 
-        canvas.create_rectangle(0, 0, 132, 160, fill=self.theme["card"], outline=self.theme["card"])
+        canvas.create_rectangle(0, 0, 132, 188, fill=self.theme["card"], outline=self.theme["card"])
         menu_rect(8, 8, 124, 33, 7, self.theme["menu_hover"])
-        canvas.create_line(14, 116, 118, 116, fill=self.theme["border"])
+        canvas.create_line(14, 144, 118, 144, fill=self.theme["border"])
 
         actions = [
             ("重新读取", self.refresh, True),
             (f"配色: {self.theme['label']}", self.next_theme, True),
+            (f"大小: {int(self.scale * 100)}%", self.next_scale, True),
             ("复制摘要", self.copy_summary, False),
             ("切换置顶", self.toggle_topmost, False),
             ("退出", self.close, False),
@@ -443,7 +475,7 @@ class QuotaWidget:
         self.menu_window.after(100, self.menu_window.focus_force)
 
     def highlight_menu(self, canvas: tk.Canvas, index: int) -> None:
-        for row_index in range(5):
+        for row_index in range(6):
             canvas.itemconfigure(f"row{row_index}", fill=self.theme["card"])
         canvas.itemconfigure(f"row{index}", fill=self.theme["menu_hover"])
 
@@ -453,6 +485,17 @@ class QuotaWidget:
         self.theme = dict(THEMES[self.theme_name])
         self.settings["theme"] = self.theme_name
         write_settings(self.settings)
+        self.redraw()
+
+    def next_scale(self) -> None:
+        index = SCALE_OPTIONS.index(self.scale)
+        self.scale = SCALE_OPTIONS[(index + 1) % len(SCALE_OPTIONS)]
+        self.settings["scale"] = self.scale
+        write_settings(self.settings)
+        self.window_w = int(WINDOW_W * self.scale)
+        self.window_h = int(WINDOW_H * self.scale)
+        self.root.geometry(f"{self.window_w}x{self.window_h}+{self.root.winfo_x()}+{self.root.winfo_y()}")
+        self.canvas.configure(width=self.window_w, height=self.window_h)
         self.redraw()
 
     def menu_action(self, action) -> None:
