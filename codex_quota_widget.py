@@ -2,8 +2,10 @@ import argparse
 import glob
 import json
 import os
+import queue
 import subprocess
 import sys
+import threading
 import time
 import tkinter as tk
 from dataclasses import dataclass
@@ -131,6 +133,10 @@ class QuotaSnapshot:
     credits_exhausted: bool = False
 
 
+def popen_no_window() -> int:
+    return subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+
 def read_settings() -> dict:
     try:
         return json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
@@ -167,18 +173,131 @@ def tail_text(path: Path, max_bytes: int = 2_000_000) -> str:
 def parse_limit(raw: dict | None) -> LimitInfo:
     if not isinstance(raw, dict):
         return LimitInfo(None, None, None)
-    used = raw.get("used_percent")
+    used = raw.get("used_percent", raw.get("usedPercent"))
     try:
         used_num = float(used)
     except (TypeError, ValueError):
         used_num = None
     remaining = None if used_num is None else max(0.0, min(100.0, 100.0 - used_num))
-    resets_at = raw.get("resets_at")
+    resets_at = raw.get("resets_at", raw.get("resetsAt"))
     try:
         resets_at_num = int(resets_at) if resets_at is not None else None
     except (TypeError, ValueError):
         resets_at_num = None
     return LimitInfo(used_num, remaining, resets_at_num)
+
+
+def find_codex_cli() -> Path | None:
+    env_cli = os.environ.get("CODEX_CLI")
+    if env_cli:
+        path = Path(env_cli)
+        if path.exists():
+            return path
+    local_root = Path(os.environ.get("LOCALAPPDATA", "")) / "OpenAI" / "Codex" / "bin"
+    candidates = sorted(local_root.glob("*/codex.exe"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if candidates:
+        return candidates[0]
+    return None
+
+
+def read_live_snapshot(timeout_sec: float = 15.0) -> QuotaSnapshot | None:
+    cli = find_codex_cli()
+    if cli is None:
+        return None
+
+    proc = subprocess.Popen(
+        [str(cli), "app-server", "--stdio"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=popen_no_window(),
+    )
+    output: queue.Queue[str] = queue.Queue()
+
+    def read_stdout() -> None:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            output.put(line)
+
+    threading.Thread(target=read_stdout, daemon=True).start()
+
+    def send(message: dict) -> None:
+        if proc.stdin is None:
+            raise RuntimeError("Codex app-server stdin is closed")
+        proc.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+        proc.stdin.flush()
+
+    try:
+        send({
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {"name": "quota-widget", "title": "Codex Quota Widget", "version": "0.1.0"},
+                "capabilities": {"experimentalApi": True, "requestAttestation": False, "optOutNotificationMethods": []},
+            },
+        })
+        send({"id": 2, "method": "account/rateLimits/read"})
+
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            try:
+                line = output.get(timeout=0.2)
+            except queue.Empty:
+                if proc.poll() is not None:
+                    break
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if item.get("id") != 2:
+                continue
+            result = item.get("result")
+            if not isinstance(result, dict):
+                return None
+            by_limit = result.get("rateLimitsByLimitId")
+            limits = None
+            if isinstance(by_limit, dict):
+                limits = by_limit.get("codex")
+            if not isinstance(limits, dict):
+                limits = result.get("rateLimits")
+            if not isinstance(limits, dict):
+                return None
+            primary = parse_limit(limits.get("primary"))
+            secondary = parse_limit(limits.get("secondary"))
+            if primary.used is None and secondary.used is None:
+                return None
+            credits = limits.get("credits")
+            return QuotaSnapshot(
+                primary=primary,
+                secondary=secondary,
+                plan_type=limits.get("planType") or limits.get("plan_type"),
+                source_file="codex app-server account/rateLimits/read",
+                source_timestamp=datetime.now().isoformat(timespec="seconds"),
+                limit_id=limits.get("limitId") or limits.get("limit_id"),
+                credits_exhausted=isinstance(credits, dict) and credits.get("hasCredits", credits.get("has_credits")) is False,
+            )
+    except Exception:
+        return None
+    finally:
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()
+        except Exception:
+            pass
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+
+def read_quota_snapshot() -> QuotaSnapshot | None:
+    return read_live_snapshot() or find_latest_snapshot()
 
 
 def find_latest_snapshot() -> QuotaSnapshot | None:
@@ -406,7 +525,7 @@ class QuotaWidget:
         )
 
     def refresh(self) -> None:
-        self.snapshot = find_latest_snapshot()
+        self.snapshot = read_quota_snapshot()
         self.redraw()
 
     def periodic_refresh(self) -> None:
@@ -543,7 +662,7 @@ def run_powershell(command: str) -> subprocess.CompletedProcess[str]:
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
         capture_output=True,
         text=True,
-        creationflags=subprocess.CREATE_NO_WINDOW,
+        creationflags=popen_no_window(),
     )
 
 
@@ -580,7 +699,7 @@ def widget_command() -> list[str]:
 def start_widget_process() -> None:
     if is_widget_running():
         return
-    subprocess.Popen(widget_command(), close_fds=True, creationflags=subprocess.CREATE_NO_WINDOW)
+    subprocess.Popen(widget_command(), close_fds=True, creationflags=popen_no_window())
 
 
 def stop_widget_processes() -> None:
@@ -614,7 +733,7 @@ def main() -> None:
         return
 
     if args.once:
-        snapshot = find_latest_snapshot()
+        snapshot = read_quota_snapshot()
         if snapshot is None:
             print(json.dumps({"ok": False, "error": "no rate_limits found"}, ensure_ascii=False))
             return

@@ -1,13 +1,13 @@
 # Codex Quota Widget
 
-粉白配色的 Windows 桌面小窗，用来显示 Codex 本地日志里的最近一次额度快照。
+粉白配色的 Windows 桌面小窗，用来显示 Codex 当前账号的剩余额度。
 
 ![Theme preview](theme_preview.png)
 
 ## 功能
 
 - 显示五小时额度、周额度和对应刷新时间。
-- 每 30 秒重新读取一次 Codex 本地日志。
+- 每 30 秒通过 Codex 本地 app-server 重新读取一次 `account/rateLimits/read`。
 - 右键菜单支持重新读取、切换配色、切换大小、复制摘要、切换置顶和退出。
 - 可拖动位置，位置保存到 `D:\Codex\quota_widget\settings.json`。
 - 可安装 watcher：Codex Desktop 打开时自动启动小窗，Codex Desktop 关闭时自动关闭小窗。
@@ -47,9 +47,9 @@ powershell -ExecutionPolicy Bypass -File .\run_quota_widget.ps1
 
 ## 说明
 
-这个小窗读取的是 Codex 本地会话日志中的 `rate_limits` 快照，不会主动请求官方服务器，也不会保存账号密码。
+这个小窗优先调用本机 Codex CLI 的 `app-server --stdio`，读取 `account/rateLimits/read` 返回的 `rateLimits` 数据；这和 Codex 设置里的“剩余用量”属于同一套本地接口。读取失败时，会回落到 Codex 本地会话日志里的 `rate_limits` 快照。
 
-右键菜单里的“重新读取”只是重新读取本地日志；如果 Codex 还没有写入新的额度快照，显示值不会变化。
+右键菜单里的“重新读取”会立即重新调用一次该接口。程序不会保存账号密码。
 
 ## 配色
 
