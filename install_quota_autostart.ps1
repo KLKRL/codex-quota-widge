@@ -1,16 +1,27 @@
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Watcher = Join-Path $ScriptDir "codex_quota_watcher.py"
+$Widget = Join-Path $ScriptDir "codex_quota_widget.py"
+$Exe = Join-Path $ScriptDir "CodexQuotaWidget.exe"
 $TaskName = "Codex Quota Widget Watcher"
 
-if (Get-Command pythonw.exe -ErrorAction SilentlyContinue) {
-    $Python = (Get-Command pythonw.exe).Source
-} else {
-    $Python = (Get-Command python.exe).Source
+if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
 }
 
-$Action = New-ScheduledTaskAction -Execute $Python -Argument "`"$Watcher`""
+if (Test-Path $Exe) {
+    $Execute = $Exe
+    $Arguments = "--watcher"
+} elseif (Get-Command pythonw.exe -ErrorAction SilentlyContinue) {
+    $Execute = (Get-Command pythonw.exe).Source
+    $Arguments = "`"$Widget`" --watcher"
+} else {
+    $Execute = (Get-Command python.exe).Source
+    $Arguments = "`"$Widget`" --watcher"
+}
+
+$Action = New-ScheduledTaskAction -Execute $Execute -Argument $Arguments
 $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-$Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Days 365)
+$Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Days 365) -MultipleInstances IgnoreNew
 
 Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings -Description "Starts the Codex quota widget when Codex Desktop is running." -Force | Out-Null
 Start-ScheduledTask -TaskName $TaskName
