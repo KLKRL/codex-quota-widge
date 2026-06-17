@@ -182,6 +182,7 @@ def parse_limit(raw: dict | None) -> LimitInfo:
 
 
 def find_latest_snapshot() -> QuotaSnapshot | None:
+    latest: tuple[str, QuotaSnapshot] | None = None
     for path in iter_candidate_logs():
         try:
             text = tail_text(path)
@@ -200,21 +201,28 @@ def find_latest_snapshot() -> QuotaSnapshot | None:
                     limits = payload.get("rate_limits")
             if not isinstance(limits, dict):
                 continue
+            if limits.get("limit_id") != "codex":
+                continue
             primary = parse_limit(limits.get("primary"))
             secondary = parse_limit(limits.get("secondary"))
             if primary.used is None and secondary.used is None:
                 continue
             credits = limits.get("credits")
-            return QuotaSnapshot(
+            timestamp = item.get("timestamp")
+            if not isinstance(timestamp, str):
+                continue
+            snapshot = QuotaSnapshot(
                 primary=primary,
                 secondary=secondary,
                 plan_type=limits.get("plan_type"),
                 source_file=str(path),
-                source_timestamp=item.get("timestamp"),
+                source_timestamp=timestamp,
                 limit_id=limits.get("limit_id"),
                 credits_exhausted=isinstance(credits, dict) and credits.get("has_credits") is False,
             )
-    return None
+            if latest is None or timestamp > latest[0]:
+                latest = (timestamp, snapshot)
+    return latest[1] if latest is not None else None
 
 
 def fmt_percent(value: float | None) -> str:
