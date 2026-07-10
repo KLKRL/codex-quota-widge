@@ -1,4 +1,5 @@
 import argparse
+import base64
 import glob
 import json
 import os
@@ -8,8 +9,10 @@ import sys
 import threading
 import time
 import tkinter as tk
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import messagebox
 
@@ -24,6 +27,10 @@ REFRESH_MS = 30_000
 WINDOW_W = 350
 WINDOW_H = 164
 SCALE_OPTIONS = [0.85, 1.0, 1.15, 1.3]
+USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+MAX_AUTH_BYTES = 256 * 1024
+MAX_RESPONSE_BYTES = 1024 * 1024
 
 THEME_ORDER = ["berry", "cream", "sakura", "mint", "sky", "dark"]
 THEMES = {
@@ -131,6 +138,11 @@ class QuotaSnapshot:
     source_timestamp: str | None
     limit_id: str | None = None
     credits_exhausted: bool = False
+    reset_credits: int | None = None
+    reset_credit_expires_at: list[int] | None = None
+    status: str = "ok"
+    message: str | None = None
+    stale: bool = False
 
 
 def popen_no_window() -> int:
@@ -138,15 +150,26 @@ def popen_no_window() -> int:
 
 
 def read_settings() -> dict:
-    try:
-        return json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    for path in [SETTINGS_PATH, SETTINGS_PATH.with_suffix(".bak")]:
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
 
 
 def write_settings(settings: dict) -> None:
     SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
-    SETTINGS_PATH.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+    raw = json.dumps(settings, ensure_ascii=False, indent=2)
+    tmp_path = SETTINGS_PATH.with_suffix(".tmp")
+    bak_path = SETTINGS_PATH.with_suffix(".bak")
+    tmp_path.write_text(raw, encoding="utf-8")
+    if SETTINGS_PATH.exists():
+        try:
+            SETTINGS_PATH.replace(bak_path)
+        except OSError:
+            pass
+    tmp_path.replace(SETTINGS_PATH)
 
 
 def iter_candidate_logs() -> list[Path]:
@@ -185,6 +208,327 @@ def parse_limit(raw: dict | None) -> LimitInfo:
     except (TypeError, ValueError):
         resets_at_num = None
     return LimitInfo(used_num, remaining, resets_at_num)
+
+
+def pick_string(value: dict, keys: list[str]) -> str | None:
+    for key in keys:
+        item = value.get(key)
+        if isinstance(item, str) and item:
+            return item
+    return None
+
+
+def account_id_from_jwt(token: str) -> str | None:
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        raw = base64.urlsafe_b64decode(payload.encode("ascii"))
+        value = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(value, dict):
+        return None
+    return pick_string(value, ["https://api.openai.com/auth.chatgpt_account_id", "chatgpt_account_id"])
+
+
+def load_auth() -> tuple[str, str | None] | None:
+    auth_path = CODEX_HOME / "auth.json"
+    try:
+        if not auth_path.is_file() or auth_path.stat().st_size > MAX_AUTH_BYTES:
+            return None
+        value = json.loads(auth_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(value, dict):
+        return None
+    tokens = value.get("tokens")
+    if not isinstance(tokens, dict):
+        tokens = value
+    access_token = pick_string(tokens, ["access_token", "accessToken"])
+    if not access_token:
+        return None
+    account_id = (
+        pick_string(tokens, ["account_id", "accountId"])
+        or pick_string(value, ["account_id", "accountId"])
+        or account_id_from_jwt(access_token)
+    )
+    return access_token, account_id
+
+
+def request_json(url: str, headers: dict[str, str], timeout_sec: float) -> dict | list | None:
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_sec) as response:
+            length = response.headers.get("Content-Length")
+            if length is not None and int(length) > MAX_RESPONSE_BYTES:
+                return None
+            raw = response.read(MAX_RESPONSE_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            return None
+        return None
+    except Exception:
+        return None
+    if len(raw) > MAX_RESPONSE_BYTES:
+        return None
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    return value if isinstance(value, (dict, list)) else None
+
+
+def number_with_key(value: dict, keys: list[str]) -> tuple[str, float] | None:
+    for key in keys:
+        item = value.get(key)
+        if isinstance(item, (int, float)):
+            return key, float(item)
+        if isinstance(item, str):
+            try:
+                return key, float(item)
+            except ValueError:
+                pass
+    return None
+
+
+def integer(value: dict | None, keys: list[str]) -> int | None:
+    if not isinstance(value, dict):
+        return None
+    for key in keys:
+        item = value.get(key)
+        if isinstance(item, bool):
+            continue
+        if isinstance(item, int):
+            return item
+        if isinstance(item, float) and item.is_integer():
+            return int(item)
+        if isinstance(item, str):
+            try:
+                return int(float(item))
+            except ValueError:
+                pass
+    return None
+
+
+def timestamp_epoch(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str) and value:
+        try:
+            return int(float(value))
+        except ValueError:
+            pass
+        try:
+            return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+        except ValueError:
+            return None
+    return None
+
+
+def timestamp_from_keys(value: dict, keys: list[str]) -> int | None:
+    for key in keys:
+        result = timestamp_epoch(value.get(key))
+        if result is not None:
+            return result
+    return None
+
+
+def scale_ratio_field(key: str, value: float) -> bool:
+    return key in {"remaining_ratio", "remainingRatio", "used_ratio", "usedRatio", "utilization"} or (
+        "percent" not in key.lower() and "pct" not in key.lower() and value <= 1.0
+    )
+
+
+def parse_usage_window(raw: object) -> LimitInfo:
+    if not isinstance(raw, dict):
+        return LimitInfo(None, None, None)
+    remaining_pair = number_with_key(
+        raw,
+        [
+            "remaining_percent",
+            "remainingPercent",
+            "remaining_pct",
+            "remainingPct",
+            "remaining_ratio",
+            "remainingRatio",
+            "remaining",
+        ],
+    )
+    used_num = None
+    if remaining_pair is not None:
+        key, remaining = remaining_pair
+        remaining_num = remaining * 100.0 if scale_ratio_field(key, remaining) else remaining
+    else:
+        used_pair = number_with_key(
+            raw,
+            [
+                "used_percent",
+                "usedPercent",
+                "used_pct",
+                "usedPct",
+                "used_ratio",
+                "usedRatio",
+                "utilization",
+                "used",
+            ],
+        )
+        if used_pair is None:
+            return LimitInfo(None, None, timestamp_from_keys(raw, ["reset_at", "resetAt", "resets_at", "resetsAt", "reset_time", "resetTime"]))
+        key, used = used_pair
+        used_num = used * 100.0 if scale_ratio_field(key, used) else used
+        remaining_num = 100.0 - used_num
+    remaining_num = max(0.0, min(100.0, remaining_num))
+    if used_num is None:
+        used_num = 100.0 - remaining_num
+    return LimitInfo(
+        used=max(0.0, min(100.0, used_num)),
+        remaining=remaining_num,
+        resets_at=timestamp_from_keys(raw, ["reset_at", "resetAt", "resets_at", "resetsAt", "reset_time", "resetTime"]),
+    )
+
+
+def window_seconds(raw: dict) -> int | None:
+    return integer(
+        raw,
+        [
+            "limit_window_seconds",
+            "limitWindowSeconds",
+            "window_seconds",
+            "windowSeconds",
+            "duration_seconds",
+            "durationSeconds",
+            "period_seconds",
+            "periodSeconds",
+        ],
+    )
+
+
+def find_window(rate_limit: object, names: list[str], expected_seconds: int) -> object | None:
+    if not isinstance(rate_limit, dict):
+        return None
+    lower_names = [name.lower() for name in names]
+    for name in names:
+        value = rate_limit.get(name)
+        if isinstance(value, dict) and parse_usage_window(value).remaining is not None:
+            return value
+    for key in ["windows", "limit_windows", "limitWindows", "limits", "buckets"]:
+        items = rate_limit.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict) or parse_usage_window(item).remaining is None:
+                continue
+            duration = window_seconds(item)
+            matches_duration = duration is not None and abs(duration - expected_seconds) <= 60
+            label = pick_string(item, ["name", "type", "id", "window", "label"])
+            matches_name = False
+            if label:
+                text = label.lower()
+                matches_name = any(text == name or name in text for name in lower_names)
+            if matches_duration or matches_name:
+                return item
+    return None
+
+
+def collect_reset_credit_expirations(value: object) -> list[int]:
+    result: set[int] = set()
+
+    def visit(item: object) -> None:
+        if isinstance(item, list):
+            for child in item:
+                visit(child)
+            return
+        if not isinstance(item, dict):
+            return
+        expires_at = timestamp_from_keys(item, ["expires_at", "expiresAt", "expiration_time", "expirationTime", "expires"])
+        if expires_at is not None:
+            result.add(expires_at)
+        for key in ["credits", "reset_credits", "resetCredits", "available", "items", "grants"]:
+            if key in item:
+                visit(item[key])
+
+    visit(value)
+    return sorted(result)
+
+
+def parse_credit_count(value: object) -> int | None:
+    if isinstance(value, dict):
+        return integer(value, ["available_count", "availableCount", "remaining", "count", "quantity"])
+    return None
+
+
+def read_wham_snapshot(timeout_sec: float = 12.0) -> QuotaSnapshot | None:
+    auth = load_auth()
+    if auth is None:
+        return None
+    access_token, account_id = auth
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "originator": "Codex Desktop",
+        "OAI-Product-Sku": "CODEX",
+        "User-Agent": "CodexQuotaWidget/0.2",
+    }
+    if account_id:
+        headers["ChatGPT-Account-Id"] = account_id
+
+    usage = request_json(USAGE_URL, headers, timeout_sec)
+    if not isinstance(usage, dict):
+        return None
+    rate_limit = usage.get("rate_limit") or usage.get("rateLimit") or usage
+    primary = parse_usage_window(
+        find_window(
+            rate_limit,
+            ["primary_window", "primaryWindow", "short_window", "shortWindow", "five_hour_window", "fiveHourWindow", "5h", "primary"],
+            18_000,
+        )
+    )
+    secondary = parse_usage_window(
+        find_window(
+            rate_limit,
+            ["secondary_window", "secondaryWindow", "weekly_window", "weeklyWindow", "week_window", "weekWindow", "weekly", "secondary"],
+            604_800,
+        )
+    )
+    if primary.remaining is None and secondary.remaining is None:
+        return None
+
+    usage_credits = usage.get("rate_limit_reset_credits") or usage.get("rateLimitResetCredits")
+    reset_credits = parse_credit_count(usage_credits)
+    expires_at = collect_reset_credit_expirations(usage_credits)
+
+    credits = request_json(CREDITS_URL, headers, timeout_sec)
+    if isinstance(credits, dict):
+        reset_credits = parse_credit_count(credits) if parse_credit_count(credits) is not None else reset_credits
+        credit_expires_at = collect_reset_credit_expirations(credits)
+        if credit_expires_at:
+            expires_at = credit_expires_at
+
+    return QuotaSnapshot(
+        primary=primary,
+        secondary=secondary,
+        plan_type=pick_string(usage, ["plan_type", "planType"]) or "codex",
+        source_file="chatgpt.com/backend-api/wham/usage",
+        source_timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        limit_id="codex",
+        reset_credits=reset_credits,
+        reset_credit_expires_at=expires_at,
+    )
+
+
+def likely_stale_rebound(previous: QuotaSnapshot | None, current: QuotaSnapshot | None) -> bool:
+    if previous is None or current is None:
+        return False
+    if previous.primary.remaining is None or current.primary.remaining is None:
+        return False
+    same_reset = previous.primary.resets_at is not None and previous.primary.resets_at == current.primary.resets_at
+    if not same_reset:
+        return False
+    if previous.reset_credits != current.reset_credits:
+        return False
+    return current.primary.remaining - previous.primary.remaining >= 25
 
 
 def find_codex_cli() -> Path | None:
@@ -296,8 +640,15 @@ def read_live_snapshot(timeout_sec: float = 15.0) -> QuotaSnapshot | None:
                 proc.kill()
 
 
-def read_quota_snapshot() -> QuotaSnapshot | None:
-    return read_live_snapshot() or find_latest_snapshot()
+def read_quota_snapshot(previous: QuotaSnapshot | None = None, force: bool = False) -> QuotaSnapshot | None:
+    snapshot = read_wham_snapshot(timeout_sec=12.0 if force else 8.0) or read_live_snapshot(timeout_sec=8.0) or find_latest_snapshot()
+    if likely_stale_rebound(previous, snapshot):
+        assert previous is not None
+        previous.stale = True
+        previous.message = "数据可能未同步，暂时保留上一次较低额度"
+        previous.source_timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        return previous
+    return snapshot
 
 
 def find_latest_snapshot() -> QuotaSnapshot | None:
@@ -412,6 +763,8 @@ class QuotaWidget:
         self.drag_offset = (0, 0)
         self.snapshot: QuotaSnapshot | None = None
         self.image_refs: list[ImageTk.PhotoImage] = []
+        self.fetching = False
+        self.pending_force_refresh = False
 
         for widget in (self.root, self.canvas):
             widget.bind("<ButtonPress-1>", self.start_drag)
@@ -419,6 +772,7 @@ class QuotaWidget:
             widget.bind("<ButtonRelease-1>", self.end_drag)
             widget.bind("<Button-3>", self.show_menu)
 
+        self.redraw()
         self.refresh()
         self.root.after(REFRESH_MS, self.periodic_refresh)
 
@@ -512,21 +866,44 @@ class QuotaWidget:
 
         self.draw_limit(82, "五小时", self.snapshot.primary)
         self.draw_limit(114, "周额度", self.snapshot.secondary)
+        footer = (
+            f"五小时 {fmt_datetime(self.snapshot.primary.resets_at)} · "
+            f"周额 {fmt_datetime(self.snapshot.secondary.resets_at)}"
+        )
+        if self.snapshot.reset_credits is not None:
+            footer += f" · 重置 {self.snapshot.reset_credits}"
+        if self.snapshot.stale:
+            footer = "疑似未同步 · " + footer
         self.text(
             24,
             146,
             anchor="w",
-            text=(
-                f"五小时 {fmt_datetime(self.snapshot.primary.resets_at)} · "
-                f"周额 {fmt_datetime(self.snapshot.secondary.resets_at)}"
-            ),
-            fill=self.theme["muted"],
+            text=footer,
+            fill="#E11D48" if self.snapshot.stale else self.theme["muted"],
             font=self.font("Microsoft YaHei UI", 8),
         )
 
-    def refresh(self) -> None:
-        self.snapshot = read_quota_snapshot()
+    def refresh(self, force: bool = False) -> None:
+        if self.fetching:
+            self.pending_force_refresh = self.pending_force_refresh or force
+            return
+        self.fetching = True
+        previous = self.snapshot
+
+        def worker() -> None:
+            snapshot = read_quota_snapshot(previous=previous, force=force)
+            self.root.after(0, lambda: self.apply_snapshot(snapshot))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def apply_snapshot(self, snapshot: QuotaSnapshot | None) -> None:
+        if snapshot is not None or self.snapshot is None:
+            self.snapshot = snapshot
+        self.fetching = False
         self.redraw()
+        if self.pending_force_refresh:
+            self.pending_force_refresh = False
+            self.refresh(force=True)
 
     def periodic_refresh(self) -> None:
         self.refresh()
@@ -539,7 +916,8 @@ class QuotaWidget:
             f"Codex Quota: 五小时剩余 {fmt_percent(self.snapshot.primary.remaining)}, "
             f"周额度剩余 {fmt_percent(self.snapshot.secondary.remaining)}, "
             f"五小时刷新 {fmt_datetime(self.snapshot.primary.resets_at)}, "
-            f"周额度刷新 {fmt_datetime(self.snapshot.secondary.resets_at)}"
+            f"周额度刷新 {fmt_datetime(self.snapshot.secondary.resets_at)}, "
+            f"重置次数 {self.snapshot.reset_credits if self.snapshot.reset_credits is not None else '--'}"
         )
 
     def copy_summary(self) -> None:
@@ -575,7 +953,7 @@ class QuotaWidget:
         canvas.create_line(14, 144, 118, 144, fill=self.theme["border"])
 
         actions = [
-            ("重新读取", self.refresh, True),
+            ("重新读取", lambda: self.refresh(force=True), True),
             (f"配色: {self.theme['label']}", self.next_theme, True),
             (f"大小: {int(self.scale * 100)}%", self.next_scale, True),
             ("复制摘要", self.copy_summary, False),
@@ -743,6 +1121,10 @@ def main() -> None:
             "secondary_remaining": snapshot.secondary.remaining,
             "primary_resets": fmt_datetime(snapshot.primary.resets_at),
             "secondary_resets": fmt_datetime(snapshot.secondary.resets_at),
+            "reset_credits": snapshot.reset_credits,
+            "reset_credit_expires": [fmt_datetime(item) for item in snapshot.reset_credit_expires_at or []],
+            "stale": snapshot.stale,
+            "message": snapshot.message,
             "plan_type": snapshot.plan_type,
             "source_timestamp": snapshot.source_timestamp,
             "source_file": snapshot.source_file,

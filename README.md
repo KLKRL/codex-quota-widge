@@ -7,7 +7,8 @@
 ## 功能
 
 - 显示五小时额度、周额度和对应刷新时间。
-- 每 30 秒通过 Codex 本地 app-server 重新读取一次 `account/rateLimits/read`。
+- 每 30 秒优先通过 ChatGPT/Codex 官方 `wham/usage` 接口重新读取一次额度。
+- 显示可用的 rate-limit reset credits 数量；复制摘要时也会带上重置次数。
 - 右键菜单支持重新读取、切换配色、切换大小、复制摘要、切换置顶和退出。
 - 可拖动位置，位置保存到 `D:\Codex\quota_widget\settings.json`。
 - 可安装 watcher：Codex Desktop 打开时自动启动小窗，Codex Desktop 关闭时自动关闭小窗。
@@ -47,9 +48,9 @@ powershell -ExecutionPolicy Bypass -File .\run_quota_widget.ps1
 
 ## 说明
 
-这个小窗优先调用本机 Codex CLI 的 `app-server --stdio`，读取 `account/rateLimits/read` 返回的 `rateLimits` 数据；这和 Codex 设置里的“剩余用量”属于同一套本地接口。读取失败时，会回落到 Codex 本地会话日志里的 `rate_limits` 快照。
+这个小窗优先读取本机 `~/.codex/auth.json` 里的 Codex 登录凭证，并请求 ChatGPT/Codex 官方的 `wham/usage` 和 `wham/rate-limit-reset-credits` 接口；读取失败时，会依次回落到本机 Codex CLI 的 `app-server --stdio` / `account/rateLimits/read`，以及 Codex 本地会话日志里的 `rate_limits` 快照。
 
-右键菜单里的“重新读取”会立即重新调用一次该接口。程序不会保存账号密码。
+右键菜单里的“重新读取”会立即强制重新请求官方接口。程序不会保存账号密码、token、cookie 或完整账号 ID。
 
 ## 配色
 
