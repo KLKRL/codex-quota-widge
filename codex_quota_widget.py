@@ -870,8 +870,6 @@ class QuotaWidget:
             f"五小时 {fmt_datetime(self.snapshot.primary.resets_at)} · "
             f"周额 {fmt_datetime(self.snapshot.secondary.resets_at)}"
         )
-        if self.snapshot.reset_credits is not None:
-            footer += f" · 重置 {self.snapshot.reset_credits}"
         if self.snapshot.stale:
             footer = "疑似未同步 · " + footer
         self.text(
@@ -916,8 +914,7 @@ class QuotaWidget:
             f"Codex Quota: 五小时剩余 {fmt_percent(self.snapshot.primary.remaining)}, "
             f"周额度剩余 {fmt_percent(self.snapshot.secondary.remaining)}, "
             f"五小时刷新 {fmt_datetime(self.snapshot.primary.resets_at)}, "
-            f"周额度刷新 {fmt_datetime(self.snapshot.secondary.resets_at)}, "
-            f"重置次数 {self.snapshot.reset_credits if self.snapshot.reset_credits is not None else '--'}"
+            f"周额度刷新 {fmt_datetime(self.snapshot.secondary.resets_at)}"
         )
 
     def copy_summary(self) -> None:
