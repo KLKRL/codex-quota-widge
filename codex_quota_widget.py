@@ -1,5 +1,6 @@
 import argparse
 import base64
+import ctypes
 import glob
 import json
 import os
@@ -1062,16 +1063,22 @@ def is_widget_running() -> bool:
     return bool(run_powershell(command).stdout.strip())
 
 
-def is_another_watcher_running() -> bool:
-    script_name = "codex_quota_widget.py"
-    exe_name = "CodexQuotaWidget.exe"
-    command = (
-        "$self = " + str(os.getpid()) + "; Get-CimInstance Win32_Process | Where-Object { "
-        "($_.Name -match '^pythonw?\\.exe$' -and $_.CommandLine -like '*" + script_name + "*--watcher*') "
-        "-or ($_.Name -ieq '" + exe_name + "' -and $_.CommandLine -like '*--watcher*') "
-        "} | Where-Object { $_.ProcessId -ne $self } | Select-Object -First 1 -ExpandProperty ProcessId"
-    )
-    return bool(run_powershell(command).stdout.strip())
+WATCHER_MUTEX_HANDLE: int | None = None
+
+
+def acquire_watcher_lock() -> bool:
+    """Keep one active watcher without mistaking PyInstaller's launcher for one."""
+    global WATCHER_MUTEX_HANDLE
+    if os.name != "nt":
+        return True
+    mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\CodexQuotaWidgetWatcher")
+    if not mutex:
+        return True
+    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        ctypes.windll.kernel32.CloseHandle(mutex)
+        return False
+    WATCHER_MUTEX_HANDLE = mutex
+    return True
 
 
 def widget_command() -> list[str]:
@@ -1116,7 +1123,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.watcher:
-        if is_another_watcher_running():
+        if not acquire_watcher_lock():
             return
         run_watcher()
         return
